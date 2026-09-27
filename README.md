@@ -20,7 +20,7 @@ Built milestone by milestone against `docs/spec.md`.
 
 - [x] **Milestone 1 — Process isolation via namespaces** (PID, UTS, mount)
 - [x] **Milestone 2 — Filesystem isolation** (`pivot_root` onto an Alpine rootfs)
-- [ ] Milestone 3 — Resource limiting via cgroups v2
+- [x] **Milestone 3 — Resource limiting via cgroups v2** (CPU + memory)
 - [ ] Milestone 4 — Syscall tracing
 - [ ] Milestone 5 — Baseline learner
 - [ ] Milestone 6 — Real-time anomaly detection
@@ -36,6 +36,9 @@ go build -o sentri .
 
 # 3. Run an isolated shell (root required for namespaces + pivot_root):
 sudo ./sentri run /bin/sh
+
+# ...optionally with resource limits (flags go BEFORE the command):
+sudo ./sentri run --memory 100m --cpus 0.5 /bin/sh
 ```
 
 Inside the shell you should see it running as PID 1, with its own hostname, its
@@ -131,3 +134,29 @@ Once the container is in its own mount namespace (from Milestone 1), the child:
 
 See [`isolation/filesystem.go`](isolation/filesystem.go) for the fully commented
 implementation and the chroot-escape explanation.
+
+## Milestone 3 — resource limits (cgroups v2)
+
+**Namespaces isolate what a process can *see*; cgroups limit what it can
+*use*.** With `--memory` and/or `--cpus`, `sentri` creates a cgroup v2 cgroup,
+writes the limits, and has the kernel place the container into it:
+
+```
+/sys/fs/cgroup/
+  └── sentri/            our parent cgroup (delegates cpu + memory to children)
+        └── <id>/        the container's cgroup: memory.max + cpu.max live here
+```
+
+- **`--memory 50m`** → writes `memory.max` = 52428800. Exceeding it OOM-kills a
+  process *inside this cgroup only*.
+- **`--cpus 0.5`** → writes `cpu.max` = `50000 100000` (50 ms of CPU per 100 ms
+  window = half a core); the scheduler throttles the cgroup past that.
+
+The container is placed into the cgroup **atomically at clone time**
+(`CLONE_INTO_CGROUP`), so it's constrained from its first instruction — no
+window where it runs unlimited. On exit, `sentri` **removes the cgroup
+directory** (cgroups live in the host filesystem and don't self-destruct like
+namespaces do).
+
+See [`isolation/cgroups.go`](isolation/cgroups.go) for the fully commented
+implementation.

@@ -76,15 +76,21 @@ const defaultRootfs = "rootfs"
 // needs it.
 const rootfsEnv = "SENTRI_ROOTFS"
 
+// Config holds everything the parent needs to launch a container.
+type Config struct {
+	Command     []string // program + args to run inside the container (e.g. ["/bin/sh"])
+	MemoryLimit string   // human string like "100m" or "1g"; "" = no memory limit
+	CPULimit    float64  // CPU cores, e.g. 0.5 = half a core; 0 = no CPU limit
+}
+
 // Run is the PARENT side of the re-exec pattern.
 //
 // It launches a fresh copy of THIS binary (/proc/self/exe) as a child process,
 // re-invoking it with the hidden "child" subcommand, and asks the kernel to
-// place that child in new namespaces via the Cloneflags below. The parent then
-// simply waits for the child to exit.
-//
-// command is the program (and its args) the user wants to run in the container.
-func Run(command []string) error {
+// place that child in new namespaces via the Cloneflags below (and, if resource
+// limits were requested, directly into a cgroup). The parent then waits for the
+// child to exit and cleans up.
+func Run(cfg Config) error {
 	// Resolve the rootfs directory to an ABSOLUTE path. pivot_root (used in the
 	// child) requires absolute paths, and resolving here — in the parent, before
 	// we enter any namespace — means we can validate it and give the user a
@@ -108,7 +114,7 @@ func Run(command []string) error {
 	//
 	// exec.Command does NOT start anything yet; it just builds the description
 	// of the process we want.
-	cmd := exec.Command("/proc/self/exe", append([]string{"child"}, command...)...)
+	cmd := exec.Command("/proc/self/exe", append([]string{"child"}, cfg.Command...)...)
 
 	// Wire the child's standard streams to ours so the interactive shell's
 	// input/output flows through to the user's terminal.
@@ -155,6 +161,42 @@ func Run(command []string) error {
 		attr.Setctty = true // make the terminal our controlling terminal...
 		attr.Ctty = 0       // ...using file descriptor 0 (stdin)
 	}
+
+	// RESOURCE LIMITS (Milestone 3).
+	// If the user requested a memory and/or CPU limit, create a cgroup v2 cgroup
+	// carrying those limits and have the kernel place the child DIRECTLY into it
+	// at clone time via CLONE_INTO_CGROUP (the UseCgroupFD/CgroupFD fields below).
+	// Being born INTO the cgroup is race-free: the process is constrained from
+	// its very first instruction. The classic alternative — start the process,
+	// then echo its PID into the cgroup's cgroup.procs — leaves a brief window
+	// where it runs unconstrained; we avoid that. (Full detail in cgroups.go.)
+	var cgDir *os.File
+	cleanupCgroup := func() {}
+	if cfg.MemoryLimit != "" || cfg.CPULimit > 0 {
+		memBytes, err := parseMemory(cfg.MemoryLimit)
+		if err != nil {
+			return err
+		}
+		f, cleanup, err := setupCgroup(containerID(), memBytes, cfg.CPULimit)
+		if err != nil {
+			return fmt.Errorf("cgroup setup: %w", err)
+		}
+		cgDir = f
+		cleanupCgroup = cleanup
+		attr.UseCgroupFD = true     // tell Go to clone the child into a cgroup...
+		attr.CgroupFD = int(f.Fd()) // ...this one: the fd of the leaf cgroup dir
+	}
+	// When the container exits (or if we fail to launch it), close the cgroup fd
+	// and remove the cgroup directory. We close BEFORE removing to avoid EBUSY on
+	// the rmdir. This is the explicit cleanup cgroups need — unlike namespaces,
+	// a cgroup lives in the host's cgroup filesystem and does NOT disappear on
+	// its own when the process exits.
+	defer func() {
+		if cgDir != nil {
+			cgDir.Close()
+		}
+		cleanupCgroup()
+	}()
 
 	cmd.SysProcAttr = attr
 

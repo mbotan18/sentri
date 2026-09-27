@@ -1,33 +1,61 @@
-// Package cmd holds the user-facing CLI subcommands. For Milestone 1 that is
-// just `run`. Later milestones add ps, exec, train, etc.
+// Package cmd holds the user-facing CLI subcommands. For now that is just
+// `run`. Later milestones add ps, exec, train, etc.
 //
 // This file is deliberately thin: its only job is to parse what the USER typed
 // and hand off to the isolation package, which owns the actual kernel-level
-// mechanics. Keeping "CLI parsing" and "namespace mechanics" in separate
+// mechanics. Keeping "CLI parsing" and "namespace/cgroup mechanics" in separate
 // packages makes each one easy to explain and test on its own.
 package cmd
 
-import "sentri/isolation"
+import (
+	"flag"
+	"fmt"
+	"os"
 
-// Run implements `sentri run [command...]`.
+	"sentri/isolation"
+)
+
+// Run implements `sentri run [--memory <size>] [--cpus <n>] [command...]`.
 //
-// args is everything the user typed after "run". For example:
+// args is everything the user typed after "run". Examples:
 //
-//	sentri run /bin/sh            -> args = ["/bin/sh"]
-//	sentri run /bin/echo hello    -> args = ["/bin/echo", "hello"]
-//
-// Milestone 1 has no flags yet (--memory, --cpus arrive in Milestone 3 with
-// cgroups), so we treat every argument as part of the command to run.
+//	sentri run /bin/sh                          -> shell, no limits
+//	sentri run --memory 50m /bin/sh             -> shell capped at 50 MiB RAM
+//	sentri run --cpus 0.5 /bin/sh               -> shell capped at half a core
+//	sentri run --memory 100m --cpus 0.5 /bin/sh -> both
 func Run(args []string) error {
-	// If the user gave no command, default to an interactive shell. This makes
-	// `sudo ./sentri run` on its own drop you straight into the container,
-	// which is the quickest way to poke around and verify isolation.
-	if len(args) == 0 {
-		args = []string{"/bin/sh"}
+	// A FlagSet parses just this subcommand's flags (kept separate from any
+	// global flags). ContinueOnError lets us return the error instead of the
+	// flag package calling os.Exit itself.
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+
+	memory := fs.String("memory", "", "memory limit, e.g. 100m or 1g (default: unlimited)")
+	cpus := fs.Float64("cpus", 0, "CPU limit in cores, e.g. 0.5 for half a core (default: unlimited)")
+
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "usage: sentri run [--memory <size>] [--cpus <n>] [command...]\n\n")
+		fs.PrintDefaults()
 	}
 
-	// Hand off to the isolation layer. isolation.Run is the "parent" side of
-	// the re-exec pattern described in main.go: it clones a copy of ourselves
-	// into new namespaces and waits for it to finish.
-	return isolation.Run(args)
+	// flag.Parse stops at the FIRST non-flag argument, so flags must come before
+	// the command: `sentri run --memory 50m /bin/sh`. Everything from the
+	// command onward is returned by fs.Args() untouched (so the command can have
+	// its own flags without us mis-parsing them).
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	command := fs.Args()
+	if len(command) == 0 {
+		// No command given: default to an interactive shell.
+		command = []string{"/bin/sh"}
+	}
+
+	// Hand off to the isolation layer with everything it needs.
+	return isolation.Run(isolation.Config{
+		Command:     command,
+		MemoryLimit: *memory,
+		CPULimit:    *cpus,
+	})
 }
