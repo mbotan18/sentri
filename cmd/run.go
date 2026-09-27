@@ -32,9 +32,11 @@ func Run(args []string) error {
 
 	memory := fs.String("memory", "", "memory limit, e.g. 100m or 1g (default: unlimited)")
 	cpus := fs.Float64("cpus", 0, "CPU limit in cores, e.g. 0.5 for half a core (default: unlimited)")
+	trace := fs.Bool("trace", false, "trace the container's syscalls to a JSON-lines log")
+	traceLog := fs.String("trace-log", "trace.jsonl", "path for the syscall trace log (with --trace)")
 
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: sentri run [--memory <size>] [--cpus <n>] [command...]\n\n")
+		fmt.Fprintf(os.Stderr, "usage: sentri run [--memory <size>] [--cpus <n>] [--trace] [--trace-log <path>] [command...]\n\n")
 		fs.PrintDefaults()
 	}
 
@@ -57,5 +59,7 @@ func Run(args []string) error {
 		Command:     command,
 		MemoryLimit: *memory,
 		CPULimit:    *cpus,
+		Trace:       *trace,
+		TraceLog:    *traceLog,
 	})
 }

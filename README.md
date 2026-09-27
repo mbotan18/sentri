@@ -21,7 +21,7 @@ Built milestone by milestone against `docs/spec.md`.
 - [x] **Milestone 1 — Process isolation via namespaces** (PID, UTS, mount)
 - [x] **Milestone 2 — Filesystem isolation** (`pivot_root` onto an Alpine rootfs)
 - [x] **Milestone 3 — Resource limiting via cgroups v2** (CPU + memory)
-- [ ] Milestone 4 — Syscall tracing
+- [x] **Milestone 4 — Syscall tracing** (`ptrace`, JSON-lines log)
 - [ ] Milestone 5 — Baseline learner
 - [ ] Milestone 6 — Real-time anomaly detection
 - [ ] Milestone 7 — Documentation and polish
@@ -160,3 +160,34 @@ namespaces do).
 
 See [`isolation/cgroups.go`](isolation/cgroups.go) for the fully commented
 implementation.
+
+## Milestone 4 — syscall tracing
+
+This begins the security half of sentri. With `--trace`, sentri `ptrace`s the
+container and logs **every syscall the workload makes** as JSON lines:
+
+```bash
+sudo ./sentri run --trace /bin/cat /etc/hostname
+# writes trace.jsonl, one line per syscall:
+# {"ts":"…","syscall":"openat","pid":1234,"args":[…],"path":"/etc/hostname"}
+# {"ts":"…","syscall":"read","pid":1234,"args":[…]}
+# {"ts":"…","syscall":"close","pid":1234,"args":[…]}
+```
+
+- The **parent** process is the tracer; the container is the tracee. Tracing runs
+  on a single locked OS thread (a hard ptrace requirement in Go).
+- Logging starts at the **target program's `execve`**, so the log is the
+  workload's syscalls, not sentri's own namespace/pivot_root setup.
+- Child processes are followed automatically (`PTRACE_O_TRACEFORK` etc.).
+- For path-taking syscalls (`openat`, `execve`, …) the pathname is read out of
+  the tracee's memory and included as `path`.
+
+**Why `ptrace` and not `seccomp`?** ptrace sees every syscall *with arguments* and
+can read tracee memory (paths), which is what a *learn-and-detect* system needs;
+seccomp-BPF is lower-overhead and can *block*, but can't read pointers on its own.
+The production design is the hybrid (seccomp `RET_TRACE` fast-pathing into ptrace).
+The trade-off — and ptrace's **overhead** (two context switches per syscall) — is
+discussed in [`monitor/tracer_linux_amd64.go`](monitor/tracer_linux_amd64.go).
+
+> Note: the tracer decodes x86-64 syscall numbers, so this milestone is
+> **linux/amd64**-specific (the register layout and numbers are per-architecture).

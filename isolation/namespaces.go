@@ -56,7 +56,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"syscall"
+
+	"sentri/monitor"
 )
 
 // containerHostname is the hostname we set inside the container's UTS
@@ -81,6 +84,8 @@ type Config struct {
 	Command     []string // program + args to run inside the container (e.g. ["/bin/sh"])
 	MemoryLimit string   // human string like "100m" or "1g"; "" = no memory limit
 	CPULimit    float64  // CPU cores, e.g. 0.5 = half a core; 0 = no CPU limit
+	Trace       bool     // if true, ptrace the container and log its syscalls
+	TraceLog    string   // path for the JSON-lines syscall log (when Trace is set)
 }
 
 // Run is the PARENT side of the re-exec pattern.
@@ -198,6 +203,15 @@ func Run(cfg Config) error {
 		cleanupCgroup()
 	}()
 
+	// If syscall tracing was requested (Milestone 4), take the ptrace path: the
+	// tracer must be the parent and must drive the child on a single, locked OS
+	// thread. Otherwise, run normally.
+	if cfg.Trace {
+		attr.Ptrace = true // child does PTRACE_TRACEME and stops at its first exec
+		cmd.SysProcAttr = attr
+		return traceRun(cmd, cfg.TraceLog)
+	}
+
 	cmd.SysProcAttr = attr
 
 	// cmd.Run() = Start() + Wait(): it starts the child (in its new namespaces)
@@ -210,6 +224,40 @@ func Run(cfg Config) error {
 	// hand. (Cgroups in Milestone 3 WILL need explicit cleanup, because those
 	// live in the host's cgroup filesystem, not in a namespace.)
 	return cmd.Run()
+}
+
+// traceRun launches the container under ptrace and runs the tracer loop.
+//
+// Unlike the normal path (cmd.Run), ptrace requires that the process is STARTED
+// and then driven from the SAME OS thread — the Go scheduler must not move us to
+// a different thread mid-trace, or the ptrace calls fail with ESRCH. So we lock
+// the goroutine to its thread for the whole trace, use cmd.Start() (not Run),
+// and let monitor.Trace do the wait/ptrace loop and reap the child itself. We
+// deliberately do NOT call cmd.Wait() — that would race the tracer's own wait4.
+func traceRun(cmd *exec.Cmd, logPath string) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	// The trace log is written on the HOST filesystem (the parent is never
+	// pivot_root'ed), so it survives after the container exits.
+	f, err := os.Create(logPath)
+	if err != nil {
+		return fmt.Errorf("create trace log %s: %w", logPath, err)
+	}
+	defer f.Close()
+
+	// With SysProcAttr.Ptrace set, Start() forks the child, which calls
+	// PTRACE_TRACEME and stops at its first execve, waiting for us.
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start traced child: %w", err)
+	}
+
+	if err := monitor.Trace(cmd.Process.Pid, f); err != nil {
+		return fmt.Errorf("tracer: %w", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "sentri: syscall trace written to %s\n", logPath)
+	return nil
 }
 
 // Child is the IN-NAMESPACE side of the re-exec pattern. By the time this runs,

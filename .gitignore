@@ -30,7 +30,9 @@ azure.json       # Azure CLI / SDK credential dumps
 alpine-minirootfs-*.tar.gz
 *.tar.gz
 
-# Learned syscall baselines (Milestone 5) are generated artifacts.
+# Syscall trace logs (Milestone 4) and learned baselines (Milestone 5) are
+# generated artifacts, not source.
+*.jsonl
 /baselines/
 
 # Editor / OS noise
