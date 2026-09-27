@@ -50,6 +50,14 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "train":
+		// `sentri train <image> [command...]`: run a workload under tracing and
+		// learn/update the "normal" syscall baseline for that image.
+		if err := cmd.Train(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "sentri: train failed: %v\n", err)
+			os.Exit(1)
+		}
+
 	case "child":
 		// INTERNAL ONLY. This is the re-exec target from cmd.Run — it is already
 		// running inside the new namespaces. A user should never type this.
@@ -69,8 +77,12 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `sentri - a minimal container runtime (learning project)
 
 usage:
-  sentri run [command...]    run a command in an isolated container
+  sentri run [--memory <size>] [--cpus <n>] [--trace] [command...]
+                             run a command in an isolated container
                              (defaults to /bin/sh if no command is given)
+  sentri train <image> [command...]
+                             run a workload under tracing and learn/update the
+                             "normal" syscall baseline for <image>
 
 note: must be run as root / with sudo, because creating namespaces
       requires the CAP_SYS_ADMIN capability.

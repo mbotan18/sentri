@@ -22,7 +22,7 @@ Built milestone by milestone against `docs/spec.md`.
 - [x] **Milestone 2 — Filesystem isolation** (`pivot_root` onto an Alpine rootfs)
 - [x] **Milestone 3 — Resource limiting via cgroups v2** (CPU + memory)
 - [x] **Milestone 4 — Syscall tracing** (`ptrace`, JSON-lines log)
-- [ ] Milestone 5 — Baseline learner
+- [x] **Milestone 5 — Baseline learner** (`sentri train`, per-image profile)
 - [ ] Milestone 6 — Real-time anomaly detection
 - [ ] Milestone 7 — Documentation and polish
 
@@ -191,3 +191,37 @@ discussed in [`monitor/tracer_linux_amd64.go`](monitor/tracer_linux_amd64.go).
 
 > Note: the tracer decodes x86-64 syscall numbers, so this milestone is
 > **linux/amd64**-specific (the register layout and numbers are per-architecture).
+
+## Milestone 5 — baseline learner
+
+`sentri train` runs a workload under tracing and distils it into a **per-image
+"normal" syscall profile**, saved as JSON under `baselines/`:
+
+```bash
+sudo ./sentri train alpine            # run the default representative workload
+cat baselines/alpine.json
+```
+```json
+{
+  "image": "alpine",
+  "training_runs": 1,
+  "total_syscalls": 812,
+  "syscalls": { "openat": 41, "read": 55, "close": 38, "execve": 4, ... }
+}
+```
+
+**What the baseline is (design decision):** a per-syscall **frequency profile**
+(name → count) plus totals. It answers the two questions the detector
+(Milestone 6) asks — *was this syscall ever seen as normal?* and *is its rate an
+outlier?* — is order-independent, and accumulates cleanly across multiple
+`train` runs. A sequence/**bigram** model (ordered syscall pairs) is a documented
+future extension, deliberately left out of the MVP so it can't block detection.
+
+The aggregation logic is pure and **unit-tested** independently of any container:
+
+```bash
+go test ./monitor
+```
+
+See [`monitor/baseline.go`](monitor/baseline.go) and
+[`monitor/baseline_test.go`](monitor/baseline_test.go).
