@@ -1,279 +1,296 @@
 # sentri
 
-A minimal container runtime built from scratch in Go — Linux namespaces,
-cgroups v2, and filesystem isolation — with an integrated **syscall-level
-anomaly detector** that learns a "normal" syscall profile per image and flags
-deviations at runtime.
+**A minimal container runtime built from scratch in Go — Linux namespaces,
+cgroups v2, and filesystem isolation — with an integrated syscall-level anomaly
+detector that learns each image's "normal" behaviour and flags deviations in
+real time.**
 
-This is a learning / portfolio project. It is **not** a production sandbox; see
-"Limitations" (added in a later milestone) for an honest account of what it does
-and does not guarantee.
+Most "build your own Docker" projects stop at isolation. `sentri` adds a security
+layer *inside* the runtime: it traces every syscall a container makes, learns a
+baseline profile per image, and raises live alerts when a running container steps
+outside that profile — a purpose-built, lightweight intrusion-detection system in
+the spirit of [Falco](https://falco.org/), rather than isolation with security
+bolted on afterwards.
 
-> ⚠️ **Linux + root required.** sentri uses `clone()` namespace flags, cgroups
-> v2, `pivot_root`, and `ptrace` — Linux-only kernel features. It does not run
-> on macOS or Windows. Run it on a real Linux machine, VM, or cloud instance,
-> as **root / with `sudo`** (creating namespaces needs `CAP_SYS_ADMIN`).
+> ⚠️ **Linux + root required.** `sentri` uses `clone()` namespace flags, cgroups
+> v2, `pivot_root`, and `ptrace` — Linux-only kernel features. It does **not** run
+> on macOS or Windows. Run it on a real Linux machine, VM, or cloud instance, as
+> **root / with `sudo`** (namespace and cgroup operations need `CAP_SYS_ADMIN`).
+> Syscall decoding is **x86-64 (amd64)**-specific.
 
-## Build status
+---
 
-Built milestone by milestone against `docs/spec.md`.
+## Demo — catching a simulated compromise
 
-- [x] **Milestone 1 — Process isolation via namespaces** (PID, UTS, mount)
-- [x] **Milestone 2 — Filesystem isolation** (`pivot_root` onto an Alpine rootfs)
-- [x] **Milestone 3 — Resource limiting via cgroups v2** (CPU + memory)
-- [x] **Milestone 4 — Syscall tracing** (`ptrace`, JSON-lines log)
-- [x] **Milestone 5 — Baseline learner** (`sentri train`, per-image profile)
-- [x] **Milestone 6 — Real-time anomaly detection** (`sentri run --monitor`, demo payload)
-- [ ] Milestone 7 — Documentation and polish
+▶️ **Watch the 30-second demo:** <!-- REPLACE: paste your screen-recording link here -->
+_(recording link — see "Adding the demo recording" below)_
+
+The scenario: train a baseline from a benign "app", then run two workloads under
+live monitoring — the **same benign app** (no alerts), and a **compromised
+payload** that phones home and tampers with a file. Same runtime, opposite
+verdicts:
+
+```text
+$ sudo ./sentri run --monitor webapp /bin/sh /normal.sh
+[sentri] monitoring against baseline "webapp" (26 known syscalls)
+app: healthy
+✓ no anomalies — behaviour matched baseline "webapp"
+
+$ sudo ./sentri run --monitor webapp /bin/sh /payload.sh
+[sentri] monitoring against baseline "webapp" (26 known syscalls)
+🚨 ANOMALY  syscall=socket   pid=8821  container=1a2b3c4d  reason=never-seen-in-baseline(webapp)
+🚨 ANOMALY  syscall=connect  pid=8821  container=1a2b3c4d  reason=never-seen-in-baseline(webapp)
+🚨 ANOMALY  syscall=chmod    pid=8823  container=1a2b3c4d  reason=never-seen-in-baseline(webapp)  path="/tmp/work"
+payload: done
+✗ 3 anomalous syscall(s) across 3 type(s): [chmod connect socket]
+```
+
+*(The alert lines render bold-red in a real terminal. Excerpt above is
+representative — swap in your captured output if you prefer verbatim.)*
+
+---
+
+## What this demonstrates
+
+- **OS/kernel fundamentals:** namespaces, cgroups v2, `pivot_root`, `ptrace` —
+  used directly via syscalls, no container libraries.
+- **A security-engineering angle:** behavioural baselining and anomaly detection,
+  built into the runtime rather than added alongside it.
+- **Honest engineering:** the code is heavily commented to be *explained and
+  defended* — including its limitations (see the end of this README).
+
+It is a **demonstration of understanding, not a hardened production sandbox.**
+
+---
+
+## Architecture
+
+```mermaid
+flowchart LR
+    U([user]) -->|"run / train / monitor"| CLI["CLI (main.go, cmd/)"]
+    CLI --> ISO
+    subgraph ISO["Isolation (isolation/)"]
+      direction TB
+      NS["namespaces: PID, UTS, mount"]
+      FS["filesystem: pivot_root to Alpine rootfs"]
+      CG["cgroups v2: cpu.max, memory.max"]
+    end
+    ISO --> CON["Container process (PID 1)"]
+    CON --> TR["ptrace tracer (monitor/tracer)"]
+    TR -->|"--trace"| LOG[("trace.jsonl (syscall log)")]
+    LOG --> LEARN["baseline learner (sentri train)"]
+    LEARN --> PROF[("baselines/IMAGE.json (normal profile)")]
+    TR -->|"--monitor"| DET["anomaly detector (monitor/detector)"]
+    PROF -.->|"compare"| DET
+    DET --> ALERT["real-time alerts"]
+```
+
+| Component | Package / file | Responsibility |
+|-----------|----------------|----------------|
+| CLI | `main.go`, `cmd/` | Parse `run` / `train`; dispatch the internal `child` re-exec |
+| Namespaces | `isolation/namespaces.go` | Clone the container into new PID/UTS/mount namespaces |
+| Filesystem | `isolation/filesystem.go` | `pivot_root` onto the Alpine rootfs; mount `/proc` |
+| Cgroups | `isolation/cgroups.go` | Create/limit/clean up a cgroup v2 cgroup |
+| Tracer | `monitor/tracer_linux_amd64.go` | `ptrace` loop → a stream of `SyscallEvent`s |
+| Learner | `monitor/baseline.go` | Aggregate a trace into a per-image profile (JSON) |
+| Detector | `monitor/detector.go` | Compare live syscalls to the baseline; alert |
+
+---
+
+## How the anomaly detection works (plain language)
+
+Security detection comes in two flavours. **Signature-based** detection looks for
+known-bad patterns (a specific malware hash, a known exploit string) — precise,
+but blind to anything new. **Anomaly-based** (behavioural) detection instead
+learns what *normal* looks like and flags anything that deviates — it can catch
+novel attacks, at the cost of needing a good "normal" model.
+
+`sentri` is anomaly-based, applied at the **syscall** level:
+
+1. **Learn.** `sentri train <image>` runs a known-good workload, traces every
+   syscall, and records which syscalls that image makes and how often — its
+   "normal" profile (`baselines/<image>.json`).
+2. **Detect.** `sentri run --monitor <image>` traces a live container and, for
+   every syscall as it happens, asks: *was this ever part of normal for this
+   image?* If not, it alerts immediately.
+
+The insight is that a compromise almost always has to do something *new at the
+syscall level* — a benign file-processing app that suddenly opens a network
+socket (`socket`/`connect`), rewrites file permissions (`chmod`), or attaches a
+debugger (`ptrace`) is making syscalls its normal profile never contained.
+
+**Link to SIEM/IPS work.** This is the same principle behind anomaly-based IDS/IPS
+and UEBA in a SOC: establish a behavioural baseline, then alert on deviation. Here
+the "log source" is the kernel's syscall stream and the "baseline" is per-image
+instead of per-user/host.
+<!-- Personalise: cite your SIEM/IPS home-lab and/or dissertation n-gram work here. -->
+
+---
 
 ## Quick start
 
+**1. Build** (on the Linux box):
 ```bash
-# 1. Build the binary (on the Linux box):
 go build -o sentri .
-
-# 2. Obtain a root filesystem into ./rootfs  (see next section)
-
-# 3. Run an isolated shell (root required for namespaces + pivot_root):
-sudo ./sentri run /bin/sh
-
-# ...optionally with resource limits (flags go BEFORE the command):
-sudo ./sentri run --memory 100m --cpus 0.5 /bin/sh
 ```
 
-Inside the shell you should see it running as PID 1, with its own hostname, its
-own process tree, **and** the Alpine root filesystem instead of the host's.
-
-## Obtaining a root filesystem
-
-`sentri` does **not** implement an image registry client (out of scope — see the
-spec's Non-Goals). Instead you populate `./rootfs` with a minimal Alpine root
-filesystem once, and every `sentri run` pivots into it.
-
-**Recommended — download the official Alpine minirootfs** (no Docker needed).
-Run this from the project root on the Linux box:
-
+**2. Get a root filesystem into `./rootfs`** — `sentri` doesn't implement an image
+registry (out of scope); you populate `./rootfs` once with a minimal Alpine
+rootfs, and every run pivots into it:
 ```bash
-# Grab the current stable Alpine minirootfs and extract it into ./rootfs.
-# 'latest-stable' always points at the current Alpine release, so we scrape the
-# exact filename from the release directory rather than hard-coding a version.
+# downloads the current stable Alpine minirootfs and extracts it into ./rootfs
 BASE=https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64
 FILE=$(curl -s "$BASE/" | grep -o 'alpine-minirootfs-[0-9.]*-x86_64.tar.gz' | sort -u | head -1)
 curl -LO "$BASE/$FILE"
-sudo tar -xzf "$FILE" -C rootfs        # sudo so file ownership (root) is preserved
+sudo tar -xzf "$FILE" -C rootfs        # sudo preserves root file ownership
+cat rootfs/etc/os-release              # sanity check → "Alpine Linux"
 ```
+*(`rootfs/` is git-ignored — large and easy to re-fetch, so it's never committed.)*
 
-**Alternative — export it from Docker** (if you already have Docker):
-
+**3. Run an isolated shell:**
 ```bash
-docker export "$(docker create alpine)" | sudo tar -C rootfs -xf -
+sudo ./sentri run /bin/sh
+# inside: PID 1, own hostname, Alpine filesystem, own process tree
 ```
 
-Either way, verify it worked:
-
+**4. Try the security layer** (the demo):
 ```bash
-cat rootfs/etc/os-release   # should say Alpine Linux
-ls rootfs/bin               # should list busybox and friends
+sudo cp demo/normal_workload.sh rootfs/normal.sh
+sudo cp demo/compromised_payload/payload.sh rootfs/payload.sh
+sudo ./sentri train webapp /bin/sh /normal.sh          # learn "normal"
+sudo ./sentri run --monitor webapp /bin/sh /normal.sh  # → no anomalies
+sudo ./sentri run --monitor webapp /bin/sh /payload.sh # → real-time alerts
 ```
 
-`rootfs/` is git-ignored (it's large and easy to re-fetch), so it is never
-committed.
+---
 
-## Why `pivot_root`, not plain `chroot`
+## Commands
 
-`chroot(2)` only changes which directory the process treats as `/` for path
-lookups. It does **not** move mounts or sever the process from the host, so a
-process still running as root can escape a `chroot` jail: because `chroot`
-leaves your working directory untouched, you can hold a directory file
-descriptor (or CWD) *outside* the new root, `chroot` into a subdirectory, then
-`chdir("..")` repeatedly to climb back above the jail and `chroot(".")` on the
-real root — landing back in the host filesystem.
-
-`pivot_root(2)`, combined with the mount namespace (`CLONE_NEWNS`), is stronger:
-it swaps the actual **root mount** of our private mount namespace to the Alpine
-rootfs and then **unmounts the old host root entirely** (`MNT_DETACH`). After
-that, the host filesystem is not merely hidden from path resolution — it is not
-mounted in our namespace at all, so the "climb upward" escape has nowhere to go.
-
-**Honest caveat:** `pivot_root` alone is *not* a security sandbox. The container
-still runs as real root with full capabilities and the entire syscall surface.
-True hardening also requires a **user namespace** (so container-root ≠
-host-root), **dropping capabilities**, and **seccomp** syscall filtering — none
-of which `sentri` does yet. This is documented, not hidden; see Limitations.
-
-## Milestone 1 — what's isolated (and what isn't yet)
-
-`sentri run` places the process in three new Linux namespaces:
-
-| Flag | Namespace | What it gives the container |
-|------|-----------|-----------------------------|
-| `CLONE_NEWPID` | PID | Its own process-ID space; the shell is PID 1 and cannot see host processes. |
-| `CLONE_NEWUTS` | UTS | Its own hostname, changeable without affecting the host. |
-| `CLONE_NEWNS`  | Mount | Its own mount table, so mounting a fresh `/proc` stays private to the container. |
-
-Namespaces isolate **visibility**, not consumption:
-
-- ~~The container still shares the host filesystem.~~ **Done in Milestone 2** —
-  `pivot_root` switches the container onto the Alpine rootfs; `ls /` and
-  `cat /etc/os-release` now show Alpine, not the host.
-- It still shares the **host network**.
-- It has **no resource limits** — fixed in Milestone 3 with cgroups v2.
-
-## Milestone 2 — filesystem isolation
-
-Once the container is in its own mount namespace (from Milestone 1), the child:
-
-1. Marks its mount tree **private** so nothing propagates to the host.
-2. **Bind-mounts** `./rootfs` onto itself (pivot_root needs the new root to be a
-   real mount point).
-3. Calls **`pivot_root`** to make the Alpine rootfs its `/` and park the old root
-   at `/.pivot_old`.
-4. Mounts a fresh **`/proc`** inside the new root (so `ps` works).
-5. **Detaches** the old root (`MNT_DETACH`) and removes the stash directory —
-   after this the host filesystem is gone from the container's view.
-
-See [`isolation/filesystem.go`](isolation/filesystem.go) for the fully commented
-implementation and the chroot-escape explanation.
-
-## Milestone 3 — resource limits (cgroups v2)
-
-**Namespaces isolate what a process can *see*; cgroups limit what it can
-*use*.** With `--memory` and/or `--cpus`, `sentri` creates a cgroup v2 cgroup,
-writes the limits, and has the kernel place the container into it:
-
-```
-/sys/fs/cgroup/
-  └── sentri/            our parent cgroup (delegates cpu + memory to children)
-        └── <id>/        the container's cgroup: memory.max + cpu.max live here
+```text
+sentri run   [--memory <size>] [--cpus <n>] [--trace] [--monitor <image>] [command...]
+sentri train <image> [command...]
 ```
 
-- **`--memory 50m`** → writes `memory.max` = 52428800. Exceeding it OOM-kills a
-  process *inside this cgroup only*.
-- **`--cpus 0.5`** → writes `cpu.max` = `50000 100000` (50 ms of CPU per 100 ms
-  window = half a core); the scheduler throttles the cgroup past that.
+| Flag | Effect |
+|------|--------|
+| `--memory 100m` | Cap container memory (cgroup `memory.max`); OOM-kills past it |
+| `--cpus 0.5` | Cap CPU to half a core (cgroup `cpu.max`) |
+| `--trace` | Log every syscall to `trace.jsonl` (JSON lines) |
+| `--monitor <image>` | Live anomaly detection against `<image>`'s baseline |
 
-The container is placed into the cgroup **atomically at clone time**
-(`CLONE_INTO_CGROUP`), so it's constrained from its first instruction — no
-window where it runs unlimited. On exit, `sentri` **removes the cgroup
-directory** (cgroups live in the host filesystem and don't self-destruct like
-namespaces do).
+Flags go **before** the command. Default command is `/bin/sh`.
 
-See [`isolation/cgroups.go`](isolation/cgroups.go) for the fully commented
-implementation.
+---
 
-## Milestone 4 — syscall tracing
+## Implementation notes
 
-This begins the security half of sentri. With `--trace`, sentri `ptrace`s the
-container and logs **every syscall the workload makes** as JSON lines:
+### Namespaces — isolating *visibility*
+`sentri run` clones the container into three namespaces: **PID** (`CLONE_NEWPID`
+— the shell is PID 1 and can't see host processes), **UTS** (`CLONE_NEWUTS` — own
+hostname), and **mount** (`CLONE_NEWNS` — own mount table). Because Go's runtime
+is multi-threaded and can't safely enter namespaces in-process, `sentri`
+re-executes its own binary (`/proc/self/exe`) as a hidden `child` that the kernel
+places into the new namespaces — the same "re-exec" pattern Docker's libcontainer
+uses.
 
-```bash
-sudo ./sentri run --trace /bin/cat /etc/hostname
-# writes trace.jsonl, one line per syscall:
-# {"ts":"…","syscall":"openat","pid":1234,"args":[…],"path":"/etc/hostname"}
-# {"ts":"…","syscall":"read","pid":1234,"args":[…]}
-# {"ts":"…","syscall":"close","pid":1234,"args":[…]}
-```
+### `pivot_root`, not `chroot` — isolating the filesystem
+`chroot(2)` only changes path resolution and leaves the process attached to the
+host, so a root process can escape it (hold a dir fd outside the new root,
+`chdir("..")` above it, `chroot(".")` back onto the host). `pivot_root(2)` +
+the mount namespace instead swaps the root **mount** and lets `sentri` **unmount
+the old host root** (`MNT_DETACH`) — the host filesystem isn't hidden, it's gone
+from the namespace. See [`isolation/filesystem.go`](isolation/filesystem.go).
 
-- The **parent** process is the tracer; the container is the tracee. Tracing runs
-  on a single locked OS thread (a hard ptrace requirement in Go).
-- Logging starts at the **target program's `execve`**, so the log is the
-  workload's syscalls, not sentri's own namespace/pivot_root setup.
-- Child processes are followed automatically (`PTRACE_O_TRACEFORK` etc.).
-- For path-taking syscalls (`openat`, `execve`, …) the pathname is read out of
-  the tracee's memory and included as `path`.
+### Cgroups v2 — limiting *consumption*
+Namespaces isolate what a process can *see*; cgroups limit what it can *use*.
+`sentri` creates `/sys/fs/cgroup/sentri/<id>/`, delegates the `cpu`+`memory`
+controllers, writes `memory.max`/`cpu.max`, and places the container into the
+cgroup **atomically at clone time** (`CLONE_INTO_CGROUP`) so it's constrained
+from its first instruction. The cgroup is removed on exit (with a `cgroup.kill` +
+retry to beat the kernel's async-release `EBUSY` race). See
+[`isolation/cgroups.go`](isolation/cgroups.go).
 
-**Why `ptrace` and not `seccomp`?** ptrace sees every syscall *with arguments* and
-can read tracee memory (paths), which is what a *learn-and-detect* system needs;
-seccomp-BPF is lower-overhead and can *block*, but can't read pointers on its own.
-The production design is the hybrid (seccomp `RET_TRACE` fast-pathing into ptrace).
-The trade-off — and ptrace's **overhead** (two context switches per syscall) — is
-discussed in [`monitor/tracer_linux_amd64.go`](monitor/tracer_linux_amd64.go).
+### `ptrace`, not `seccomp` — tracing syscalls
+`ptrace(PTRACE_SYSCALL)` sees **every** syscall with its arguments and can read
+tracee memory (so paths like `openat("/etc/os-release")` are decoded) — exactly
+what a *learn-and-detect* system needs. seccomp-BPF is lower-overhead and can
+*block*, but its filter can't dereference pointers. The production design is the
+hybrid (seccomp `RET_TRACE` fast-pathing into ptrace). Cost: ~2× wall-time on a
+syscall-heavy workload (two context switches per syscall). The tracer is a single
+locked-OS-thread loop that follows `fork`/`vfork`/`clone` children and detects
+syscall-entry via the kernel's `-ENOSYS` sentinel. See
+[`monitor/tracer_linux_amd64.go`](monitor/tracer_linux_amd64.go).
 
-> Note: the tracer decodes x86-64 syscall numbers, so this milestone is
-> **linux/amd64**-specific (the register layout and numbers are per-architecture).
+### Baseline — a per-syscall frequency profile
+The baseline is a map of syscall name → count (plus totals), keyed by image.
+It's order-independent, tiny, accumulates across training runs, and directly
+answers the detector's question ("seen before?"). A sequence/**bigram** model
+(ordered pairs — catches anomalous *ordering*) is a documented future extension,
+kept out of the MVP on purpose. See [`monitor/baseline.go`](monitor/baseline.go).
 
-## Milestone 5 — baseline learner
+### Anomaly rule — stated exactly
+A syscall is flagged **iff its name was never observed in the baseline for that
+image** ("unknown-syscall" rule). No threshold, no magic number: a workload
+matching training yields zero alerts; a compromise doing something new is caught.
+Alerts are de-duplicated to one line per distinct syscall for readability. A
+frequency/rate rule is available in principle but left off to avoid false
+positives. See [`monitor/detector.go`](monitor/detector.go).
 
-`sentri train` runs a workload under tracing and distils it into a **per-image
-"normal" syscall profile**, saved as JSON under `baselines/`:
+---
 
-```bash
-sudo ./sentri train alpine            # run the default representative workload
-cat baselines/alpine.json
-```
-```json
-{
-  "image": "alpine",
-  "training_runs": 1,
-  "total_syscalls": 812,
-  "syscalls": { "openat": 41, "read": 55, "close": 38, "execve": 4, ... }
-}
-```
+## Testing
 
-**What the baseline is (design decision):** a per-syscall **frequency profile**
-(name → count) plus totals. It answers the two questions the detector
-(Milestone 6) asks — *was this syscall ever seen as normal?* and *is its rate an
-outlier?* — is order-independent, and accumulates cleanly across multiple
-`train` runs. A sequence/**bigram** model (ordered syscall pairs) is a documented
-future extension, deliberately left out of the MVP so it can't block detection.
-
-The aggregation logic is pure and **unit-tested** independently of any container:
+Kernel-dependent parts (namespaces, cgroups, ptrace) are verified by running real
+containers and asserting on observable outcomes (PID 1 inside, hostname
+isolation, enforced limits, alerts firing). The **pure logic** — baseline
+aggregation and anomaly scoring — has proper unit tests fed synthetic syscall
+logs, runnable on any platform:
 
 ```bash
 go test ./monitor
 ```
 
-See [`monitor/baseline.go`](monitor/baseline.go) and
-[`monitor/baseline_test.go`](monitor/baseline_test.go).
+---
 
-## Milestone 6 — real-time anomaly detection (the headline)
+## Limitations and what this is *not*
 
-`sentri run --monitor <image>` traces a container live and, for **every syscall
-as it happens**, checks it against the image's baseline. This is the security
-payoff: a purpose-built, lightweight IDS *inside* the runtime.
+Being explicit here is deliberate — overclaiming security guarantees would be the
+real red flag.
 
-**The anomaly rule (stated exactly — no magic number):** a syscall is flagged if
-its name was **never seen in the baseline** for this image ("unknown-syscall"
-rule). It's high-precision — a workload matching the training produces **zero
-alerts**, while a compromise that performs a new *kind* of action (opening a
-socket, calling `ptrace`, changing permissions) necessarily uses syscalls the
-benign profile never held, so it's caught. We alert **once per distinct
-anomalous syscall** so the output stays readable. A frequency/rate-based rule is
-a documented alternative, deliberately left off to avoid false-positive noise.
-See [`monitor/detector.go`](monitor/detector.go) (and its unit tests).
+- **Not a production sandbox.** The container runs as **real root with full
+  capabilities** and the entire syscall surface. Real hardening needs a **user
+  namespace** (so container-root ≠ host-root), **capability dropping**, and a
+  **seccomp** allowlist — none of which `sentri` implements.
+- **Detection, not prevention.** `sentri` *flags* anomalous syscalls; it does not
+  *block* them. Blocking is seccomp enforcement — a natural next step, not built.
+- **`ptrace` has real costs.** ~2× overhead on syscall-heavy workloads, and
+  ptrace-based tracing has known bypasses; it's an observation tool here, not a
+  security boundary.
+- **Baseline trade-offs are inherent.** The profile is only as good as the
+  training workload: too narrow → benign-but-unseen behaviour looks anomalous
+  (false positives); too broad → real compromises blend in (false negatives). The
+  unknown-syscall rule also can't catch a compromise that only *reorders* or
+  *over-uses* already-normal syscalls — that's what the bigram/rate extensions
+  would address.
+- **No networking or OCI images.** No bridge/veth/NAT; no registry client (you
+  supply the rootfs). Both are noted non-goals.
+- **linux/amd64 only.** Syscall numbers and register layout are architecture-
+  specific.
 
-### The demo
+---
 
-Scripts live in [`demo/`](demo/): `normal_workload.sh` (a benign file-reading
-"app") and `compromised_payload/payload.sh` (inert, but makes the syscalls of a
-real compromise — an outbound `connect()` to a reserved TEST-NET address, and a
-`chmod()`).
+## Project status
 
-```bash
-# copy the scripts into the container rootfs (pivot_root replaces the fs)
-sudo cp demo/normal_workload.sh rootfs/normal.sh
-sudo cp demo/compromised_payload/payload.sh rootfs/payload.sh
+Built milestone by milestone against [`docs/spec.md`](docs/spec.md):
 
-# 1. learn "normal" from the benign app
-sudo ./sentri train webapp /bin/sh /normal.sh
+- [x] **M1** — Process isolation via namespaces (PID, UTS, mount)
+- [x] **M2** — Filesystem isolation (`pivot_root` onto Alpine rootfs)
+- [x] **M3** — Resource limiting via cgroups v2 (CPU + memory)
+- [x] **M4** — Syscall tracing (`ptrace`, JSON-lines log)
+- [x] **M5** — Baseline learner (`sentri train`)
+- [x] **M6** — Real-time anomaly detection (`sentri run --monitor`) + demo
+- [x] **M7** — Documentation and polish
 
-# 2. run the SAME workload monitored -> no false positives
-sudo ./sentri run --monitor webapp /bin/sh /normal.sh
-#    ✓ no anomalies — behaviour matched baseline "webapp"
-
-# 3. run the compromised payload monitored -> real-time alerts
-sudo ./sentri run --monitor webapp /bin/sh /payload.sh
-#    🚨 ANOMALY  syscall=socket   pid=…  container=…  reason=never-seen-in-baseline(webapp)
-#    🚨 ANOMALY  syscall=connect  pid=…  container=…  reason=never-seen-in-baseline(webapp)
-#    🚨 ANOMALY  syscall=chmod    pid=…  container=…  reason=never-seen-in-baseline(webapp)
-#    ✗ N anomalous syscall(s) across 3 type(s): [chmod connect socket]
-```
-
-> 📹 A screen recording of this demo is the project's headline artifact — see the
-> top of this README. <!-- TODO(Milestone 7): embed the recording link here -->
-
-**Honest limitation:** this is *detection*, not *prevention* — sentri flags the
-anomalous syscall, it does not block it (that would be seccomp enforcement, a
-noted future step). And the baseline is only as good as the training workload:
-too narrow and benign-but-unseen behaviour looks anomalous; too broad and real
-compromises blend in.
+**Possible next steps:** seccomp enforcement (block, not just detect); a
+bigram/sequence baseline; a user namespace + capability drop; a network
+namespace; a webhook alert sink.
