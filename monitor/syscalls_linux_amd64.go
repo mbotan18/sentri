@@ -48,6 +48,11 @@ var syscallNames = map[int]string{
 	21:  "access",
 	22:  "pipe",
 	23:  "select",
+	24:  "sched_yield",
+	25:  "mremap",
+	28:  "madvise",
+	35:  "nanosleep",
+	40:  "sendfile", // busybox cat/cp use this to copy a file to stdout
 	32:  "dup",
 	33:  "dup2",
 	39:  "getpid",
@@ -90,6 +95,8 @@ var syscallNames = map[int]string{
 	95:  "umask",
 	96:  "gettimeofday",
 	97:  "getrlimit",
+	99:  "sysinfo",
+	100: "times",
 	101: "ptrace", // security-relevant: debugging/injection/anti-debug
 	102: "getuid",
 	104: "getgid",
@@ -99,6 +106,8 @@ var syscallNames = map[int]string{
 	108: "getegid",
 	110: "getppid",
 	113: "setreuid",
+	137: "statfs",
+	138: "fstatfs",
 	157: "prctl",
 	158: "arch_prctl",
 	186: "gettid",
@@ -106,7 +115,9 @@ var syscallNames = map[int]string{
 	217: "getdents64",
 	218: "set_tid_address",
 	228: "clock_gettime",
+	230: "clock_nanosleep",
 	231: "exit_group",
+	234: "tgkill",
 	257: "openat", // the modern open; very common in any file access
 	258: "mkdirat",
 	260: "fchownat",
@@ -128,6 +139,7 @@ var syscallNames = map[int]string{
 	319: "memfd_create", // security-relevant: fileless execution
 	322: "execveat",     // security-relevant: running new programs
 	332: "statx",
+	334: "rseq", // per-thread restartable sequences; common in modern libc/musl startup
 	435: "clone3", // modern process creation
 	439: "faccessat2",
 }

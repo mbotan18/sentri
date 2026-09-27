@@ -112,8 +112,7 @@ func Trace(rootPID int, out io.Writer) error {
 	// switch to PTRACE_SYSCALL, recording everything from there.
 	logging := false
 
-	known := map[int]bool{rootPID: true} // pids we've initialised
-	atEntry := map[int]bool{}            // per-pid: is the next syscall-stop an ENTRY?
+	known := map[int]bool{rootPID: true} // pids we've initialised (for child tracking)
 
 	// resume continues a stopped tracee — stepping to the next syscall boundary
 	// once we're logging, or running freely until then. `sig` injects a pending
@@ -144,7 +143,6 @@ func Trace(rootPID int, out io.Writer) error {
 		// A tracee exited or was killed by a signal: forget it.
 		if ws.Exited() || ws.Signaled() {
 			delete(known, pid)
-			delete(atEntry, pid)
 			continue
 		}
 		if !ws.Stopped() {
@@ -156,7 +154,6 @@ func Trace(rootPID int, out io.Writer) error {
 		// be an ENTRY. Don't inject its initial SIGSTOP.
 		if !known[pid] {
 			known[pid] = true
-			atEntry[pid] = true
 			resume(pid, 0)
 			continue
 		}
@@ -168,7 +165,6 @@ func Trace(rootPID int, out io.Writer) error {
 			if pid == rootPID {
 				logging = true
 			}
-			atEntry[pid] = true
 			resume(pid, 0)
 			continue
 		case evFork, evVFork, evClone:
@@ -178,17 +174,21 @@ func Trace(rootPID int, out io.Writer) error {
 			continue
 		}
 
-		// Syscall-entry / syscall-exit stop?
+		// Syscall-entry / syscall-exit stop? (The kernel stops us twice per
+		// syscall.) We only want the ENTRY, where the registers hold the real
+		// arguments. Rather than track entry/exit with a per-pid toggle (which
+		// can slip out of sync around exec/fork event stops), we detect entry
+		// directly: on syscall-ENTRY the kernel sets rax to the sentinel value
+		// -ENOSYS; on syscall-EXIT rax holds the actual return value. This is
+		// self-correcting and needs no per-pid state.
 		if ws.StopSignal() == syscallStop {
 			if logging {
-				if atEntry[pid] {
-					// ENTRY: registers hold the syscall number + arguments.
-					var regs syscall.PtraceRegs
-					if err := syscall.PtraceGetRegs(pid, &regs); err == nil {
+				var regs syscall.PtraceRegs
+				if err := syscall.PtraceGetRegs(pid, &regs); err == nil {
+					if int64(regs.Rax) == -int64(syscall.ENOSYS) { // entry
 						logSyscall(enc, pid, &regs)
 					}
 				}
-				atEntry[pid] = !atEntry[pid] // entry -> exit -> entry -> ...
 			}
 			resume(pid, 0)
 			continue
@@ -211,6 +211,11 @@ func logSyscall(enc *json.Encoder, pid int, regs *syscall.PtraceRegs) {
 	// by the return value on exit, which is why we log on entry). The six
 	// arguments are, in order, rdi, rsi, rdx, r10, r8, r9.
 	num := int(regs.Orig_rax)
+	if num < 0 {
+		// orig_rax is -1 at ptrace pseudo-stops that aren't real syscalls (e.g.
+		// right after some event stops). Not a syscall — don't log it.
+		return
+	}
 	args := []uint64{regs.Rdi, regs.Rsi, regs.Rdx, regs.R10, regs.R8, regs.R9}
 
 	ev := event{
