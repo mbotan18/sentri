@@ -1,0 +1,5 @@
+# Normalize every text file to LF in the repository and on checkout.
+# The code is authored on Windows but runs on a Linux VM; without this, Git
+# could store/checkout CRLF line endings, which break shell scripts on Linux
+# ("/bin/sh^M: bad interpreter") and are just noise in Go source.
+* text=auto eol=lf

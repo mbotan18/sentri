@@ -1,0 +1,38 @@
+# ---------------------------------------------------------------------------
+# SECRETS / KEYS — NEVER commit these.
+# A leaked cloud SSH private key or credential file is the single most common
+# cause of a compromised VM being hijacked for crypto-mining => a runaway bill.
+# These patterns make git refuse to stage them even by accident.
+# ---------------------------------------------------------------------------
+*.pem            # AWS/Azure downloaded key pairs
+*.key            # generic private keys
+*.ppk            # PuTTY keys
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+*.pfx            # Azure certificate bundles
+.env             # any local environment file with secrets
+.env.*
+azure.json       # Azure CLI / SDK credential dumps
+*.credentials
+
+# Compiled sentri binary (built locally on the Linux box, not committed)
+/sentri
+
+# The extracted Alpine root filesystem (Milestone 2) — large, machine-specific,
+# and easy to re-fetch. We document HOW to obtain it in the README instead of
+# committing it.
+/rootfs/*
+!/rootfs/.gitkeep
+
+# The downloaded rootfs tarball itself (also re-fetchable, not source).
+alpine-minirootfs-*.tar.gz
+*.tar.gz
+
+# Learned syscall baselines (Milestone 5) are generated artifacts.
+/baselines/
+
+# Editor / OS noise
+*.swp
+.DS_Store
