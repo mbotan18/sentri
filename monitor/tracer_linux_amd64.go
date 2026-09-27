@@ -36,9 +36,7 @@
 package monitor
 
 import (
-	"encoding/json"
 	"fmt"
-	"io"
 	"syscall"
 	"time"
 )
@@ -70,28 +68,20 @@ const wall = 0x40000000
 // SIGTRAPs (like breakpoints or the initial exec trap).
 const syscallStop = syscall.SIGTRAP | 0x80
 
-// event is one line of the JSON-lines trace log. Keeping it small and flat makes
-// it trivial for the Milestone 5 baseline learner to parse back.
-type event struct {
-	Time    string   `json:"ts"`             // RFC3339 nanosecond timestamp
-	Syscall string   `json:"syscall"`        // resolved name, e.g. "openat"
-	PID     int      `json:"pid"`            // host-visible pid of the tracee
-	Args    []uint64 `json:"args"`           // raw syscall args (registers)
-	Path    string   `json:"path,omitempty"` // decoded path arg, when applicable
-}
-
-// Trace drives a ptrace loop over the process tree rooted at rootPID and writes
-// one JSON line per syscall to out. rootPID was started by the caller with
-// SysProcAttr.Ptrace = true, so it is already stopped at its initial exec. Trace
-// returns once the entire tree has exited.
+// Trace drives a ptrace loop over the process tree rooted at rootPID and calls
+// emit once per observed syscall (a SyscallEvent). rootPID was started by the
+// caller with SysProcAttr.Ptrace = true, so it is already stopped at its initial
+// exec. Trace returns once the entire tree has exited.
+//
+// Decoupling the loop from a specific sink (via the emit callback) is what lets
+// the SAME tracer feed both the JSON trace log (Milestone 4/5) and the live
+// anomaly detector (Milestone 6) — the caller just supplies the handler.
 //
 // THREADING: every wait and every PTRACE_* call must run on the SAME OS thread
-// that started rootPID. The caller (isolation.traceRun) has already done
+// that started rootPID. The caller (isolation.tracedRun) has already done
 // runtime.LockOSThread() and calls us synchronously, so we run on that thread —
 // we must NOT hand any ptrace work to another goroutine.
-func Trace(rootPID int, out io.Writer) error {
-	enc := json.NewEncoder(out)
-
+func Trace(rootPID int, emit func(SyscallEvent)) error {
 	// (1) Reap the tracee's initial stop (it stopped at the execve of
 	// /proc/self/exe, i.e. our own re-exec, before any container setup).
 	var ws syscall.WaitStatus
@@ -186,7 +176,7 @@ func Trace(rootPID int, out io.Writer) error {
 				var regs syscall.PtraceRegs
 				if err := syscall.PtraceGetRegs(pid, &regs); err == nil {
 					if int64(regs.Rax) == -int64(syscall.ENOSYS) { // entry
-						logSyscall(enc, pid, &regs)
+						logSyscall(emit, pid, &regs)
 					}
 				}
 			}
@@ -205,8 +195,8 @@ func Trace(rootPID int, out io.Writer) error {
 	}
 }
 
-// logSyscall writes one JSON line describing a syscall ENTRY.
-func logSyscall(enc *json.Encoder, pid int, regs *syscall.PtraceRegs) {
+// logSyscall builds a SyscallEvent for a syscall ENTRY and hands it to emit.
+func logSyscall(emit func(SyscallEvent), pid int, regs *syscall.PtraceRegs) {
 	// On x86-64: the syscall number is in orig_rax at entry (rax gets clobbered
 	// by the return value on exit, which is why we log on entry). The six
 	// arguments are, in order, rdi, rsi, rdx, r10, r8, r9.
@@ -218,7 +208,7 @@ func logSyscall(enc *json.Encoder, pid int, regs *syscall.PtraceRegs) {
 	}
 	args := []uint64{regs.Rdi, regs.Rsi, regs.Rdx, regs.R10, regs.R8, regs.R9}
 
-	ev := event{
+	ev := SyscallEvent{
 		Time:    time.Now().UTC().Format(time.RFC3339Nano),
 		Syscall: syscallName(num),
 		PID:     pid,
@@ -231,7 +221,7 @@ func logSyscall(enc *json.Encoder, pid int, regs *syscall.PtraceRegs) {
 		ev.Path = readString(pid, uintptr(args[idx]))
 	}
 
-	_ = enc.Encode(&ev) // Encoder.Encode appends '\n' → one JSON object per line
+	emit(ev)
 }
 
 // pathArgIndex maps a syscall number to which arg (index into args) is a

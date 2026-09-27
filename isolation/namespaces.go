@@ -86,6 +86,7 @@ type Config struct {
 	CPULimit    float64  // CPU cores, e.g. 0.5 = half a core; 0 = no CPU limit
 	Trace       bool     // if true, ptrace the container and log its syscalls
 	TraceLog    string   // path for the JSON-lines syscall log (when Trace is set)
+	Monitor     string   // if non-empty, live-detect anomalies vs this image's baseline
 }
 
 // Run is the PARENT side of the re-exec pattern.
@@ -112,6 +113,10 @@ func Run(cfg Config) error {
 			"       extract an Alpine minirootfs there first "+
 			"(see README: \"Obtaining a root filesystem\")", rootfs)
 	}
+
+	// One short id identifies this container everywhere: its cgroup directory
+	// name and the "container=" field in anomaly alerts.
+	id := containerID()
 
 	// /proc/self/exe is a kernel-provided symlink to the currently running
 	// executable. Executing it starts a brand-new copy of sentri. We prepend
@@ -182,7 +187,7 @@ func Run(cfg Config) error {
 		if err != nil {
 			return err
 		}
-		f, cleanup, err := setupCgroup(containerID(), memBytes, cfg.CPULimit)
+		f, cleanup, err := setupCgroup(id, memBytes, cfg.CPULimit)
 		if err != nil {
 			return fmt.Errorf("cgroup setup: %w", err)
 		}
@@ -203,13 +208,13 @@ func Run(cfg Config) error {
 		cleanupCgroup()
 	}()
 
-	// If syscall tracing was requested (Milestone 4), take the ptrace path: the
-	// tracer must be the parent and must drive the child on a single, locked OS
-	// thread. Otherwise, run normally.
-	if cfg.Trace {
+	// If syscall tracing (Milestone 4) OR live monitoring (Milestone 6) was
+	// requested, take the ptrace path: the tracer must be the parent and must
+	// drive the child on a single, locked OS thread. Otherwise, run normally.
+	if cfg.Trace || cfg.Monitor != "" {
 		attr.Ptrace = true // child does PTRACE_TRACEME and stops at its first exec
 		cmd.SysProcAttr = attr
-		return traceRun(cmd, cfg.TraceLog)
+		return tracedRun(cmd, cfg, id)
 	}
 
 	cmd.SysProcAttr = attr
@@ -226,7 +231,10 @@ func Run(cfg Config) error {
 	return cmd.Run()
 }
 
-// traceRun launches the container under ptrace and runs the tracer loop.
+// tracedRun launches the container under ptrace and runs the tracer loop,
+// feeding each observed syscall to the sinks the config asks for: a JSON trace
+// log (--trace, Milestone 4) and/or the live anomaly detector (--monitor,
+// Milestone 6). Both can be on at once.
 //
 // Unlike the normal path (cmd.Run), ptrace requires that the process is STARTED
 // and then driven from the SAME OS thread — the Go scheduler must not move us to
@@ -234,29 +242,63 @@ func Run(cfg Config) error {
 // the goroutine to its thread for the whole trace, use cmd.Start() (not Run),
 // and let monitor.Trace do the wait/ptrace loop and reap the child itself. We
 // deliberately do NOT call cmd.Wait() — that would race the tracer's own wait4.
-func traceRun(cmd *exec.Cmd, logPath string) error {
+func tracedRun(cmd *exec.Cmd, cfg Config, id string) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	// The trace log is written on the HOST filesystem (the parent is never
-	// pivot_root'ed), so it survives after the container exits.
-	f, err := os.Create(logPath)
-	if err != nil {
-		return fmt.Errorf("create trace log %s: %w", logPath, err)
+	// Assemble the per-syscall handlers (emitters) requested by the config.
+	var emits []func(monitor.SyscallEvent)
+
+	// --trace: write a JSON-lines log on the HOST filesystem (the parent is
+	// never pivot_root'ed), so it survives after the container exits.
+	if cfg.Trace {
+		f, err := os.Create(cfg.TraceLog)
+		if err != nil {
+			return fmt.Errorf("create trace log %s: %w", cfg.TraceLog, err)
+		}
+		defer f.Close()
+		emits = append(emits, monitor.NewJSONLogger(f))
 	}
-	defer f.Close()
+
+	// --monitor: load the image's baseline and attach the live detector.
+	var det *monitor.Detector
+	if cfg.Monitor != "" {
+		b, err := monitor.LoadBaseline(monitor.DefaultBaselineDir, cfg.Monitor)
+		if err != nil {
+			return err
+		}
+		if b.TrainingRuns == 0 {
+			return fmt.Errorf("no baseline for image %q — run `sudo ./sentri train %s ...` first", cfg.Monitor, cfg.Monitor)
+		}
+		fmt.Fprintf(os.Stderr, "\033[1m[sentri] monitoring against baseline %q (%d known syscalls)\033[0m\n",
+			cfg.Monitor, len(b.Syscalls))
+		det = monitor.NewDetector(b, id, os.Stderr)
+		emits = append(emits, det.Inspect)
+	}
+
+	// Fan one event out to every sink.
+	emit := func(ev monitor.SyscallEvent) {
+		for _, e := range emits {
+			e(ev)
+		}
+	}
 
 	// With SysProcAttr.Ptrace set, Start() forks the child, which calls
 	// PTRACE_TRACEME and stops at its first execve, waiting for us.
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start traced child: %w", err)
 	}
-
-	if err := monitor.Trace(cmd.Process.Pid, f); err != nil {
+	if err := monitor.Trace(cmd.Process.Pid, emit); err != nil {
 		return fmt.Errorf("tracer: %w", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "sentri: syscall trace written to %s\n", logPath)
+	// Final verdict / pointers, after the container has exited.
+	if det != nil {
+		det.Summary()
+	}
+	if cfg.Trace {
+		fmt.Fprintf(os.Stderr, "sentri: syscall trace written to %s\n", cfg.TraceLog)
+	}
 	return nil
 }
 

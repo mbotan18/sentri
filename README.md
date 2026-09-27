@@ -23,7 +23,7 @@ Built milestone by milestone against `docs/spec.md`.
 - [x] **Milestone 3 — Resource limiting via cgroups v2** (CPU + memory)
 - [x] **Milestone 4 — Syscall tracing** (`ptrace`, JSON-lines log)
 - [x] **Milestone 5 — Baseline learner** (`sentri train`, per-image profile)
-- [ ] Milestone 6 — Real-time anomaly detection
+- [x] **Milestone 6 — Real-time anomaly detection** (`sentri run --monitor`, demo payload)
 - [ ] Milestone 7 — Documentation and polish
 
 ## Quick start
