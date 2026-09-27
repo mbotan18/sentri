@@ -54,6 +54,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -183,17 +184,34 @@ func writeCgroupFile(dir, name, value string) error {
 }
 
 // removeCgroup deletes the leaf cgroup (and the parent if it is now empty).
+//
 // A cgroup directory can only be rmdir'd once it has no member processes and no
-// child cgroups — which is the case after the container process has exited. We
-// close our directory fd before calling this (see Run) so the rmdir isn't EBUSY.
+// child cgroups. Two things can leave it briefly non-empty right after the
+// container exits, both of which a naive single rmdir trips over:
+//   - a straggler process (a grandchild that briefly outlives PID 1), and
+//   - the kernel releasing the cgroup ASYNCHRONOUSLY, so an rmdir issued in the
+//     microseconds after the process is reaped can still fail with EBUSY.
+// So we (1) tell the kernel to kill anything left in the cgroup, then (2) retry
+// the rmdir a few times with a short backoff. This is the standard way real
+// runtimes make cgroup teardown reliable.
 func removeCgroup(leafPath, parentPath string) {
-	// os.Remove on a cgroup directory issues rmdir(2); the kernel tears the
-	// cgroup down. Ignore errors: on a normal exit it succeeds, and if it
-	// somehow doesn't there is nothing useful we can do at this point.
-	_ = os.Remove(leafPath)
-	// Best-effort: also remove our `sentri` parent, but only succeeds (and only
-	// should) if no other container is still using it — rmdir fails harmlessly
-	// on a non-empty directory.
+	// (1) cgroup.kill: writing "1" SIGKILLs every process still in the cgroup
+	// (a cgroups v2 feature, kernel >= 5.14). Best-effort — a no-op if empty.
+	_ = os.WriteFile(filepath.Join(leafPath, "cgroup.kill"), []byte("1"), 0644)
+
+	// (2) Retry rmdir until it succeeds or we give up (~1s total). os.Remove on
+	// a directory issues rmdir(2), which the kernel handles specially for
+	// cgroupfs (it tears the cgroup down).
+	for i := 0; i < 20; i++ {
+		if err := os.Remove(leafPath); err == nil {
+			break // gone
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Best-effort: also remove our shared `sentri` parent, but this only
+	// succeeds (and only should) if no other container is still using it —
+	// rmdir fails harmlessly on a non-empty directory.
 	_ = os.Remove(parentPath)
 }
 
