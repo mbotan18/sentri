@@ -66,22 +66,21 @@ It is a **demonstration of understanding, not a hardened production sandbox.**
 ## Architecture
 
 ```mermaid
-flowchart LR
-    U([user]) -->|"run / train / monitor"| CLI["CLI (main.go, cmd/)"]
+flowchart TD
+    U["user"] -->|"run / train / monitor"| CLI["CLI - main.go, cmd/"]
     CLI --> ISO
-    subgraph ISO["Isolation (isolation/)"]
-      direction TB
+    subgraph ISO["Isolation - isolation/"]
       NS["namespaces: PID, UTS, mount"]
       FS["filesystem: pivot_root to Alpine rootfs"]
       CG["cgroups v2: cpu.max, memory.max"]
     end
-    ISO --> CON["Container process (PID 1)"]
-    CON --> TR["ptrace tracer (monitor/tracer)"]
-    TR -->|"--trace"| LOG[("trace.jsonl (syscall log)")]
-    LOG --> LEARN["baseline learner (sentri train)"]
-    LEARN --> PROF[("baselines/IMAGE.json (normal profile)")]
-    TR -->|"--monitor"| DET["anomaly detector (monitor/detector)"]
-    PROF -.->|"compare"| DET
+    ISO --> CON["Container process - PID 1"]
+    CON --> TR["ptrace tracer - monitor/tracer"]
+    TR -->|"--trace"| LOG["trace.jsonl - syscall log"]
+    LOG --> LEARN["baseline learner - sentri train"]
+    LEARN --> PROF["baselines/IMAGE.json - normal profile"]
+    TR -->|"--monitor"| DET["anomaly detector - monitor/detector"]
+    PROF -->|"compare"| DET
     DET --> ALERT["real-time alerts"]
 ```
 
