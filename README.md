@@ -225,3 +225,55 @@ go test ./monitor
 
 See [`monitor/baseline.go`](monitor/baseline.go) and
 [`monitor/baseline_test.go`](monitor/baseline_test.go).
+
+## Milestone 6 — real-time anomaly detection (the headline)
+
+`sentri run --monitor <image>` traces a container live and, for **every syscall
+as it happens**, checks it against the image's baseline. This is the security
+payoff: a purpose-built, lightweight IDS *inside* the runtime.
+
+**The anomaly rule (stated exactly — no magic number):** a syscall is flagged if
+its name was **never seen in the baseline** for this image ("unknown-syscall"
+rule). It's high-precision — a workload matching the training produces **zero
+alerts**, while a compromise that performs a new *kind* of action (opening a
+socket, calling `ptrace`, changing permissions) necessarily uses syscalls the
+benign profile never held, so it's caught. We alert **once per distinct
+anomalous syscall** so the output stays readable. A frequency/rate-based rule is
+a documented alternative, deliberately left off to avoid false-positive noise.
+See [`monitor/detector.go`](monitor/detector.go) (and its unit tests).
+
+### The demo
+
+Scripts live in [`demo/`](demo/): `normal_workload.sh` (a benign file-reading
+"app") and `compromised_payload/payload.sh` (inert, but makes the syscalls of a
+real compromise — an outbound `connect()` to a reserved TEST-NET address, and a
+`chmod()`).
+
+```bash
+# copy the scripts into the container rootfs (pivot_root replaces the fs)
+sudo cp demo/normal_workload.sh rootfs/normal.sh
+sudo cp demo/compromised_payload/payload.sh rootfs/payload.sh
+
+# 1. learn "normal" from the benign app
+sudo ./sentri train webapp /bin/sh /normal.sh
+
+# 2. run the SAME workload monitored -> no false positives
+sudo ./sentri run --monitor webapp /bin/sh /normal.sh
+#    ✓ no anomalies — behaviour matched baseline "webapp"
+
+# 3. run the compromised payload monitored -> real-time alerts
+sudo ./sentri run --monitor webapp /bin/sh /payload.sh
+#    🚨 ANOMALY  syscall=socket   pid=…  container=…  reason=never-seen-in-baseline(webapp)
+#    🚨 ANOMALY  syscall=connect  pid=…  container=…  reason=never-seen-in-baseline(webapp)
+#    🚨 ANOMALY  syscall=chmod    pid=…  container=…  reason=never-seen-in-baseline(webapp)
+#    ✗ N anomalous syscall(s) across 3 type(s): [chmod connect socket]
+```
+
+> 📹 A screen recording of this demo is the project's headline artifact — see the
+> top of this README. <!-- TODO(Milestone 7): embed the recording link here -->
+
+**Honest limitation:** this is *detection*, not *prevention* — sentri flags the
+anomalous syscall, it does not block it (that would be seccomp enforcement, a
+noted future step). And the baseline is only as good as the training workload:
+too narrow and benign-but-unseen behaviour looks anomalous; too broad and real
+compromises blend in.
